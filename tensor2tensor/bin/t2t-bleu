@@ -36,9 +36,9 @@ there are optional parameters:
 
  * bleu_variant: cased (case-sensitive), uncased, both (default).
  * translations_dir: Where to store the translated files? Default="translations".
- * even_subdir: Where in the model_dir to store the even file? Default="",
-   which means TensorBoard will show it as the same run as the training, but it will warn
-   about "more than one metagraph event per run". event_subdir can be used e.g. if running
+ * even_subdir: Where to store the even file? Default=$model_dir,
+   i.e. TensorBoard will show it as the same run as the training, but it will warn
+   about "more than one metagraph event per run". event_dir can be used e.g. if running
    this script several times with different `--decode_hparams="beam_size=$BEAM_SIZE,alpha=$ALPHA"`.
  * tag_suffix: Default="", so the tags will be BLEU_cased and BLEU_uncased. Again, tag_suffix
    can be used e.g. for different beam sizes if these should be plotted in different graphs.
@@ -74,11 +74,13 @@ flags.DEFINE_string("translation", None, "Path to the MT system translation file
 flags.DEFINE_string("source", None, "Path to the source-language file to be translated")
 flags.DEFINE_string("reference", None, "Path to the reference translation file")
 flags.DEFINE_string("translations_dir", "translations", "Where to store the translated files")
-flags.DEFINE_string("event_subdir", "", "Where in model_dir to store the event file")
+flags.DEFINE_string("event_dir", "", "Where to store the event file. Default is model_dir.")
 flags.DEFINE_string("tag_suffix", "", "What to add to BLEU_cased and BLEU_uncased tags. Default=''.")
 flags.DEFINE_integer("min_steps", -1, "Don't evaluate checkpoints with less steps.")
 flags.DEFINE_integer("wait_secs", 0, "Wait upto N seconds for a new checkpoint, cf. save_checkpoints_secs.")
 flags.DEFINE_bool("report_zero", None, "Store BLEU=0 and guess its time based on flags.txt")
+flags.DEFINE_bool("translate", True, "Actively translate. Default=True."
+                  " False means waiting for another job to translate it.")
 
 # options derived from t2t-decode
 flags.DEFINE_integer("decode_shards", 1, "Number of decoding replicas.")
@@ -121,6 +123,8 @@ def main(_):
   assert FLAGS.schedule == "train_and_evaluate"
   data_dir = os.path.expanduser(FLAGS.data_dir)
   model_dir = os.path.expanduser(FLAGS.model_dir)
+  if FLAGS.event_dir == '':
+    FLAGS.event_dir = model_dir
 
   hparams = trainer_utils.create_hparams(
       FLAGS.hparams_set, data_dir, passed_hparams=FLAGS.hparams)
@@ -137,8 +141,7 @@ def main(_):
 
   os.makedirs(FLAGS.translations_dir, exist_ok=True)
   translated_base_file = os.path.join(FLAGS.translations_dir, FLAGS.problems)
-  event_dir = os.path.join(FLAGS.model_dir, FLAGS.event_subdir)
-  last_step_file = os.path.join(event_dir, 'last_evaluated_step.txt')
+  last_step_file = os.path.join(FLAGS.event_dir, 'last_evaluated_step.txt')
   if FLAGS.min_steps == -1:
     try:
       with open(last_step_file) as ls_file:
@@ -151,7 +154,7 @@ def main(_):
   models = read_checkpoints_list(model_dir, FLAGS.min_steps)
   tf.logging.info("Found %d models with steps: %s" % (len(models), ", ".join(str(x.steps) for x in models)))
 
-  writer = tf.summary.FileWriter(event_dir)
+  writer = tf.summary.FileWriter(FLAGS.event_dir)
   if FLAGS.report_zero:
     start_time = os.path.getctime(os.path.join(model_dir, 'flags.txt'))
     values = []
@@ -178,9 +181,22 @@ def main(_):
     exit_time, min_steps = model.time + FLAGS.wait_secs, model.steps
     tf.logging.info("Evaluating " + model.filename)
     out_file = translated_base_file + '-' + str(model.steps)
-    tf.logging.set_verbosity(tf.logging.ERROR) # decode_from_file logs all the translations as INFO
-    decoding.decode_from_file(estimator, FLAGS.source, decode_hp, out_file, checkpoint_path=model.filename)
-    tf.logging.set_verbosity(tf.logging.INFO)
+    if os.path.exists(out_file):
+      tf.logging.info(out_file + " already exists, so reusing it.")
+    else:
+      if FLAGS.translate:
+        tf.logging.set_verbosity(tf.logging.ERROR) # decode_from_file logs all the translations as INFO
+        decoding.decode_from_file(estimator, FLAGS.source, decode_hp, out_file, checkpoint_path=model.filename)
+        tf.logging.set_verbosity(tf.logging.INFO)
+      else:
+        translation_exit_time = time.time() + FLAGS.wait_secs
+        tf.logging.info("Waiting till %s if %s will be created" % (time.asctime(time.localtime(translation_exit_time)), out_file))
+        while True:
+          time.sleep(10)
+          if os.path.exists(out_file):
+            break
+          if time.time() > translation_exit_time:
+            return
     values = []
     if FLAGS.bleu_variant in ('uncased', 'both'):
       bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, out_file, case_sensitive=False)
