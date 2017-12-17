@@ -58,13 +58,13 @@ Model = namedtuple('Model', 'filename time steps')
 
 def read_checkpoints_list(model_dir, min_steps):
   try:
-    models = [Model(x[:-6], os.path.getctime(x), int(x[:-6].rsplit('-')[-1]))
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
               for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   except FileNotFoundError:
     # If the oldest file was deleted due to race conditions after Glob
-    # and before getctime, try it once again. Models are being deleted
-    # each save_checkpoints_secs, so there this time it should be OK.
-    models = [Model(x[:-6], os.path.getctime(x), int(x[:-6].rsplit('-')[-1]))
+    # and before getmtime, try it once again. Models are being deleted
+    # each save_checkpoints_secs, so this time it should be OK.
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
               for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
 

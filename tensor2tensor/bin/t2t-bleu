@@ -98,13 +98,13 @@ Model = namedtuple('Model', 'filename time steps')
 
 def read_checkpoints_list(model_dir, min_steps):
   try:
-    models = [Model(x[:-6], os.path.getctime(x), int(x[:-6].rsplit('-')[-1]))
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
               for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   except FileNotFoundError:
     # If the oldest file was deleted due to race conditions after Glob
     # and before getctime, try it once again. Models are being deleted
     # each save_checkpoints_secs, so there this time it should be OK.
-    models = [Model(x[:-6], os.path.getctime(x), int(x[:-6].rsplit('-')[-1]))
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
               for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
 
@@ -163,7 +163,7 @@ def main(_):
   writer = tf.summary.FileWriter(FLAGS.event_dir)
   if FLAGS.report_zero:
     all_files = (os.path.join(model_dir, f) for f in os.listdir(model_dir))
-    start_time = min(os.path.getctime(f) for f in all_files if os.path.isfile(f))
+    start_time = min(os.path.getmtime(f) for f in all_files if os.path.isfile(f))
     values = []
     if FLAGS.bleu_variant in ('uncased', 'both'):
       values.append(tf.Summary.Value(tag='BLEU_uncased' + FLAGS.tag_suffix, simple_value=0))
