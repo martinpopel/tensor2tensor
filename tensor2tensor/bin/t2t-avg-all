@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2017 The Tensor2Tensor Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Script to average values of variables in a list of checkpoint files."""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import logging
+
+# Dependency imports
+
+import numpy as np
+import six
+from six.moves import zip  # pylint: disable=redefined-builtin
+from collections import namedtuple, deque
+import shutil
+import tensorflow as tf
+
+flags = tf.flags
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string("model_dir", "", "Directory to load model checkpoints from.")
+flags.DEFINE_string("output_dir", "avg/", "Directory to output the averaged checkpoints to.")
+flags.DEFINE_integer("n", 8, "How many checkpoints should be averaged?")
+flags.DEFINE_integer("min_steps", 0, "Ignore checkpoints with less steps.")
+flags.DEFINE_integer("wait_secs", 0, "Wait upto N seconds for a new checkpoint, cf. save_checkpoints_secs.")
+
+Model = namedtuple('Model', 'filename time steps')
+
+
+def read_checkpoints_list(model_dir, min_steps):
+  try:
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
+              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
+  except FileNotFoundError:
+    # If the oldest file was deleted due to race conditions after Glob
+    # and before getmtime, try it once again. Models are being deleted
+    # each save_checkpoints_secs, so this time it should be OK.
+    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
+              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
+  return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
+
+
+def main(_):
+  tf.logging._handler.setFormatter(logging.Formatter("%(asctime)s:" + logging.BASIC_FORMAT, None))
+  tf.logging.set_verbosity(tf.logging.INFO)
+
+  model_dir = os.path.expanduser(FLAGS.model_dir)
+  output_dir = os.path.expanduser(FLAGS.output_dir)
+  models = read_checkpoints_list(model_dir, FLAGS.min_steps)
+  out_base_file = os.path.join(output_dir, 'model.ckpt')
+  tf.logging.info("Found %d models with steps: %s" % (len(models), ", ".join(str(x.steps) for x in models)))
+  if len(models) < FLAGS.n:
+    raise ValueError("Not enough checkpoints provided for averaging.")
+
+  # Copy flags.txt with the original time, so t2t-bleu can report correct relative time.
+  os.makedirs(FLAGS.output_dir, exist_ok=True)
+  if not os.path.exists(os.path.join(output_dir, 'flags.txt')):
+    shutil.copy2(os.path.join(model_dir, 'flags.txt'), os.path.join(output_dir, 'flags.txt'))
+
+  var_list = tf.contrib.framework.list_variables(models[0].filename)
+  avg_values = {}
+  for (name, shape) in var_list:
+    if not name.startswith("global_step"):
+      avg_values[name] = np.zeros(shape)
+
+  queue = deque()
+  for model in models:
+    tf.logging.info("Loading " + model.filename)
+    reader = tf.contrib.framework.load_checkpoint(model.filename)
+    for name in avg_values:
+      avg_values[name] += reader.get_tensor(name) / FLAGS.n
+    queue.append(model)
+    if len(queue) < FLAGS.n:
+      continue
+
+    out_file = "%s-%d" % (out_base_file, model.steps)
+    tf_vars = []
+    tf.logging.info("Averaging %s" % (out_file))
+    for (name, value) in six.iteritems(avg_values):
+      tf_vars.append(tf.get_variable(name, shape=value.shape)) # TODO , dtype=var_dtypes[name]
+    placeholders = [tf.placeholder(v.dtype, shape=v.shape) for v in tf_vars]
+    assign_ops = [tf.assign(v, p) for (v, p) in zip(tf_vars, placeholders)]
+  
+    global_step = tf.Variable(model.steps, name="global_step", trainable=False, dtype=tf.int64)
+    saver = tf.train.Saver(tf.global_variables())
+
+    tf.logging.info("Running session for %s" % (out_file))
+    with tf.Session() as sess:
+      sess.run(tf.global_variables_initializer())
+      for p, assign_op, (name, value) in zip(placeholders, assign_ops, six.iteritems(avg_values)):
+        sess.run(assign_op, {p: value})
+      tf.logging.info("Storing to %s" % out_file)
+      saver.save(sess, out_base_file, global_step=global_step)
+      tf.logging.info("Storing done")
+    os.utime(out_file + '.index', (model.time, model.time))
+
+    if model == models[-1]:
+      return
+
+    tf.reset_default_graph()
+    first_model = queue.popleft()
+
+    reader = tf.contrib.framework.load_checkpoint(first_model.filename)
+    for name in avg_values:
+      avg_values[name] -= reader.get_tensor(name) / FLAGS.n
+
+
+if __name__ == "__main__":
+  tf.app.run()
