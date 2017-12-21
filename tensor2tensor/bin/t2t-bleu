@@ -58,6 +58,7 @@ from __future__ import print_function
 import os
 import time
 from collections import namedtuple
+from glob import glob
 from tensor2tensor.utils import decoding
 from tensor2tensor.utils import trainer_utils
 from tensor2tensor.utils import usr_dir
@@ -99,13 +100,13 @@ Model = namedtuple('Model', 'filename time steps')
 def read_checkpoints_list(model_dir, min_steps):
   try:
     models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
-              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
+              for x in glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   except FileNotFoundError:
     # If the oldest file was deleted due to race conditions after Glob
     # and before getctime, try it once again. Models are being deleted
     # each save_checkpoints_secs, so there this time it should be OK.
     models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
-              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
+              for x in glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
 
 def main(_):
