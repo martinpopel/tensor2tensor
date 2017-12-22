@@ -21,14 +21,11 @@ This script can be used in two ways.
 To evaluate one already translated file:
 `t2t-bleu --translation=my-wmt13.de --reference=wmt13_deen.de`
 
-To evaluate all checkpoints in a given directory:
+To evaluate all checkpoints/translations in a given directory:
 `t2t-bleu
   --model_dir=t2t_train
-  --data_dir=t2t_data
   --translations_dir=my-translations
   --problems=translate_ende_wmt32k
-  --hparams_set=transformer_big_single_gpu
-  --source=wmt13_deen.en
   --reference=wmt13_deen.de`
 
 In addition to the above-mentioned compulsory parameters,
@@ -57,11 +54,8 @@ from __future__ import division
 from __future__ import print_function
 import os
 import time
-from glob import glob
-from collections import namedtuple
 from tensor2tensor.utils import bleu_hook
 import tensorflow as tf
-from tensorflow.python.training import saver as tf_saver
 
 
 flags = tf.flags
@@ -80,59 +74,7 @@ flags.DEFINE_string("tag_suffix", "", "What to add to BLEU_cased and BLEU_uncase
 flags.DEFINE_integer("min_steps", -1, "Don't evaluate checkpoints with less steps.")
 flags.DEFINE_integer("wait_minutes", 0, "Wait upto N minutes for a new checkpoint, cf. save_checkpoints_secs.")
 flags.DEFINE_bool("report_zero", None, "Store BLEU=0 and guess its time based on the oldest file in model_dir")
-Model = namedtuple('Model', 'filename time steps')
 
-
-def _read_checkpoints_list(checkpoint_dir, min_steps=0):
-  ckpt_state = tf_saver.get_checkpoint_state(checkpoint_dir)
-  if not ckpt_state:
-    raise ValueError("Cannot find %s/checkpoint" % checkpoint_dir)
-  models = []
-  for ckpt_path in ckpt_state.all_model_checkpoint_paths:
-    steps = int(ckpt_path.rsplit('-')[-1])
-    if steps < min_steps:
-      continue
-    index_file = ckpt_path + '.index'
-    if not os.path.exists(index_file):
-      tf.logging.info(index_file + " was deleted, so skipping it")
-      continue
-    ckpt_time = os.path.getmtime(index_file)
-    models.append(Model(ckpt_path, ckpt_time, steps))
-  return models
-
-
-def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0):
-  """Continuously yield new checkpoint files as they appear.
-  The iterator only checks for new checkpoints when control flow has been
-  reverted to it. Unlike `tf.contrib.training.checkpoints_iterator`,
-  this implementation always starts from the oldest checkpoints
-  (and it cannot miss any checkpoint). Note that the oldest checkpoint
-  may be deleted anytime by Tensorflow (if set up so). It is up to the user
-  to check that the files returned by this generator actually exist.
-  Args:
-    checkpoint_dir: The directory in which checkpoints are saved.
-    wait_minutes: The maximum amount of minutes to wait between checkpoints.
-    min_steps: Skip checkpoints with lower global step.
-  Yields:
-    named tuples (filename, time, steps) of checkpoint files as they arrive.
-  """
-  models = _read_checkpoints_list(checkpoint_dir, min_steps)
-  tf.logging.info("Found %d models with steps: %s" % (len(models), ", ".join(str(x.steps) for x in models)))
-  exit_time = time.time() + wait_minutes * 60
-  while True:
-    if not models and wait_minutes:
-      tf.logging.info('Waiting till %s if a new checkpoint appears' % time.asctime(time.localtime(exit_time)))
-      while True:
-        time.sleep(10)
-        models = _read_checkpoints_list(model_dir, min_steps)
-        if models or time.time() > exit_time:
-          break
-    if not models:
-      return
-
-    model = models.pop(0)
-    exit_time, min_steps = model.time + wait_minutes * 60, model.steps
-    yield model
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
@@ -153,7 +95,6 @@ def main(_):
   model_dir = os.path.expanduser(FLAGS.model_dir)
   if FLAGS.event_dir == '':
     FLAGS.event_dir = model_dir
-
 
   translated_base_file = os.path.join(translations_dir, FLAGS.problems)
   last_step_file = os.path.join(FLAGS.event_dir, 'last_evaluated_step.txt')
@@ -177,11 +118,11 @@ def main(_):
       values.append(tf.Summary.Value(tag='BLEU_cased' + FLAGS.tag_suffix, simple_value=0))
     writer.add_event(tf.summary.Event(summary=tf.Summary(value=values), wall_time=start_time, step=0))
 
-  for model in checkpoints_iterator(model_dir, FLAGS.wait_minutes, FLAGS.min_steps):
+  for model in bleu_hook.checkpoints_iterator(model_dir, FLAGS.wait_minutes, FLAGS.min_steps):
     tf.logging.info("Evaluating " + model.filename)
     out_file = translated_base_file + '-' + str(model.steps)
     if not os.path.exists(out_file):
-      translation_exit_time = time.time() + FLAGS.wait_secs
+      translation_exit_time = time.time() + FLAGS.wait_minutes * 60
       tf.logging.info("Waiting till %s if %s will be created" % (time.asctime(time.localtime(translation_exit_time)), out_file))
       while True:
         time.sleep(10)

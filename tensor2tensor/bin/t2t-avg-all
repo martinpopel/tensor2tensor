@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Script to average values of variables in a list of checkpoint files."""
+"""Script to average last N checkpoints in a given directory."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -27,9 +27,10 @@ import logging
 import numpy as np
 import six
 from six.moves import zip  # pylint: disable=redefined-builtin
-from collections import namedtuple, deque
+from collections import deque
 import shutil
 import tensorflow as tf
+from tensor2tensor.utils import bleu_hook
 
 flags = tf.flags
 FLAGS = flags.FLAGS
@@ -38,22 +39,7 @@ flags.DEFINE_string("model_dir", "", "Directory to load model checkpoints from."
 flags.DEFINE_string("output_dir", "avg/", "Directory to output the averaged checkpoints to.")
 flags.DEFINE_integer("n", 8, "How many checkpoints should be averaged?")
 flags.DEFINE_integer("min_steps", 0, "Ignore checkpoints with less steps.")
-flags.DEFINE_integer("wait_secs", 0, "Wait upto N seconds for a new checkpoint, cf. save_checkpoints_secs.")
-
-Model = namedtuple('Model', 'filename time steps')
-
-
-def read_checkpoints_list(model_dir, min_steps):
-  try:
-    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
-              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
-  except FileNotFoundError:
-    # If the oldest file was deleted due to race conditions after Glob
-    # and before getmtime, try it once again. Models are being deleted
-    # each save_checkpoints_secs, so this time it should be OK.
-    models = [Model(x[:-6], os.path.getmtime(x), int(x[:-6].rsplit('-')[-1]))
-              for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
-  return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
+flags.DEFINE_integer("wait_minutes", 0, "Wait upto N minutes for a new checkpoint.")
 
 
 def main(_):
@@ -62,25 +48,24 @@ def main(_):
 
   model_dir = os.path.expanduser(FLAGS.model_dir)
   output_dir = os.path.expanduser(FLAGS.output_dir)
-  models = read_checkpoints_list(model_dir, FLAGS.min_steps)
   out_base_file = os.path.join(output_dir, 'model.ckpt')
-  tf.logging.info("Found %d models with steps: %s" % (len(models), ", ".join(str(x.steps) for x in models)))
-  if len(models) < FLAGS.n:
-    raise ValueError("Not enough checkpoints provided for averaging.")
 
   # Copy flags.txt with the original time, so t2t-bleu can report correct relative time.
   os.makedirs(FLAGS.output_dir, exist_ok=True)
   if not os.path.exists(os.path.join(output_dir, 'flags.txt')):
     shutil.copy2(os.path.join(model_dir, 'flags.txt'), os.path.join(output_dir, 'flags.txt'))
 
-  var_list = tf.contrib.framework.list_variables(models[0].filename)
-  avg_values = {}
-  for (name, shape) in var_list:
-    if not name.startswith("global_step"):
-      avg_values[name] = np.zeros(shape)
-
+  model_processed = 0
   queue = deque()
-  for model in models:
+  for model in bleu_hook.checkpoints_iterator(model_dir, FLAGS.wait_minutes, FLAGS.min_steps):
+    if model_processed == 0:
+      var_list = tf.contrib.framework.list_variables(model.filename)
+      avg_values = {}
+      for (name, shape) in var_list:
+        if not name.startswith("global_step"):
+          avg_values[name] = np.zeros(shape)      
+    model_processed += 1
+
     tf.logging.info("Loading " + model.filename)
     reader = tf.contrib.framework.load_checkpoint(model.filename)
     for name in avg_values:
@@ -109,9 +94,6 @@ def main(_):
       saver.save(sess, out_base_file, global_step=global_step)
       tf.logging.info("Storing done")
     os.utime(out_file + '.index', (model.time, model.time))
-
-    if model == models[-1]:
-      return
 
     tf.reset_default_graph()
     first_model = queue.popleft()

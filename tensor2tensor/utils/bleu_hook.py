@@ -20,9 +20,12 @@ from __future__ import print_function
 
 import collections
 import math
+import os
 import re
 import sys
+import time
 import unicodedata
+from collections import namedtuple
 
 # Dependency imports
 
@@ -195,3 +198,54 @@ def bleu_wrapper(ref_filename, hyp_filename, case_sensitive=False):
   ref_tokens = [bleu_tokenize(x) for x in ref_lines]
   hyp_tokens = [bleu_tokenize(x) for x in hyp_lines]
   return compute_bleu(ref_tokens, hyp_tokens)
+
+
+Model = namedtuple('Model', 'filename time steps')
+
+def _read_checkpoints_list(checkpoint_dir, min_steps=0):
+  models = []
+  for index_file in tf.gfile.Glob(os.path.join(checkpoint_dir, 'model.ckpt-*.index')):
+    ckpt_path = index_file[:-6]
+    steps = int(ckpt_path.rsplit('-')[-1])
+    if steps < min_steps:
+      continue
+    if not os.path.exists(index_file):
+      tf.logging.info(index_file + " was deleted, so skipping it")
+      continue
+    ckpt_time = os.path.getmtime(index_file)
+    models.append(Model(ckpt_path, ckpt_time, steps))
+  return sorted(models, key=lambda x: x.steps)
+
+
+def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0, monotonic=True):
+  """Continuously yield new checkpoint files as they appear.
+  The iterator only checks for new checkpoints when control flow has been
+  reverted to it. Unlike `tf.contrib.training.checkpoints_iterator`,
+  this implementation always starts from the oldest checkpoints
+  (and it cannot miss any checkpoint). Note that the oldest checkpoint
+  may be deleted anytime by Tensorflow (if set up so). It is up to the user
+  to check that the files returned by this generator actually exist.
+  Args:
+    checkpoint_dir: The directory in which checkpoints are saved.
+    wait_minutes: The maximum amount of minutes to wait between checkpoints.
+    min_steps: Skip checkpoints with lower global step.
+  Yields:
+    named tuples (filename, time, steps) of checkpoint files as they arrive.
+  """
+  models = _read_checkpoints_list(checkpoint_dir, min_steps)
+  tf.logging.info("Found %d models with steps: %s" % (len(models), ", ".join(str(x.steps) for x in models)))
+  exit_time = time.time() + wait_minutes * 60
+  while True:
+    if not models and wait_minutes:
+      tf.logging.info('Waiting till %s if a new checkpoint appears' % time.asctime(time.localtime(exit_time)))
+      while True:
+        time.sleep(10)
+        models = _read_checkpoints_list(checkpoint_dir, min_steps)
+        if models or time.time() > exit_time:
+          break
+    if not models:
+      return
+
+    model = models.pop(0)
+    exit_time, min_steps = model.time + wait_minutes * 60, model.steps + 1
+    yield model
