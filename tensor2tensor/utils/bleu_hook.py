@@ -214,10 +214,10 @@ def _read_checkpoints_list(checkpoint_dir, min_steps=0):
       continue
     ckpt_time = os.path.getmtime(index_file)
     models.append(Model(ckpt_path, ckpt_time, steps))
-  return sorted(models, key=lambda x: x.steps)
+  return sorted(models, key=lambda x: -x.steps)
 
 
-def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0, monotonic=True):
+def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0, sleep_sec=10):
   """Continuously yield new checkpoint files as they appear.
   The iterator only checks for new checkpoints when control flow has been
   reverted to it. Unlike `tf.contrib.training.checkpoints_iterator`,
@@ -229,6 +229,7 @@ def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0, monotonic=
     checkpoint_dir: The directory in which checkpoints are saved.
     wait_minutes: The maximum amount of minutes to wait between checkpoints.
     min_steps: Skip checkpoints with lower global step.
+    sleep_sec: How often to check for new checkpoints.
   Yields:
     named tuples (filename, time, steps) of checkpoint files as they arrive.
   """
@@ -239,13 +240,73 @@ def checkpoints_iterator(checkpoint_dir, wait_minutes=0, min_steps=0, monotonic=
     if not models and wait_minutes:
       tf.logging.info('Waiting till %s if a new checkpoint appears' % time.asctime(time.localtime(exit_time)))
       while True:
-        time.sleep(10)
+        time.sleep(sleep_sec)
         models = _read_checkpoints_list(checkpoint_dir, min_steps)
         if models or time.time() > exit_time:
           break
     if not models:
       return
 
-    model = models.pop(0)
+    model = models.pop()
     exit_time, min_steps = model.time + wait_minutes * 60, model.steps + 1
     yield model
+
+StepFile = namedtuple('StepFile', 'filename mtime ctime steps')
+
+def _read_stepfiles_list(path_prefix, path_suffix='.index', min_steps=0):
+  stepfiles = []
+  for filename in tf.gfile.Glob(path_prefix + '*-[0-9]*' + path_suffix):
+    basename = filename[:-len(path_suffix)]
+    steps = int(basename.rsplit('-')[-1])
+    if steps < min_steps:
+      continue
+    if not os.path.exists(filename):
+      tf.logging.info(filename + " was deleted, so skipping it")
+      continue
+    stepfiles.append(StepFile(basename, os.path.getmtime(filename),
+                              os.path.getctime(filename), steps))
+  return sorted(stepfiles, key=lambda x: -x.steps)
+
+
+def stepfiles_iterator(path_prefix, wait_minutes=0, min_steps=0,
+                       path_suffix='.index', sleep_sec=10):
+  """Continuously yield new files with steps in filename as they appear.
+
+  This is useful for checkpoint files or other files whose names differ just in an interger
+  marking the number of steps and match the wildcard path_prefix + '*-[0-9]*' + path_suffix.
+  Unlike `tf.contrib.training.checkpoints_iterator`, this
+  implementation always starts from the oldest files
+  (and it cannot miss any file). Note that the oldest checkpoint
+  may be deleted anytime by Tensorflow (if set up so). It is up to the user
+  to check that the files returned by this generator actually exist.
+  Args:
+    path_prefix: The directory + possible common filename prefix to the files.
+    path_suffix: Common filename suffix (after steps), including possible extension dot.
+    wait_minutes: The maximum amount of minutes to wait between files.
+    min_steps: Skip files with lower global step.
+    sleep_sec: How often to check for new files.
+  Yields:
+    named tuples (filename, mtime, ctime, steps) of the files as they arrive.
+  """
+  # Wildcard D*-[0-9]* does not match D/x-1, so if D is a directory let path_prefix='D/'.
+  if not path_prefix.endswith(os.sep) and os.path.isdir(path_prefix):
+    path_prefix += os.sep
+  stepfiles = _read_stepfiles_list(path_prefix, path_suffix, min_steps)
+  tf.logging.info("Found %d files with steps: %s"
+                  % (len(stepfiles), ", ".join(str(x.steps) for x in reversed(stepfiles))))
+  exit_time = time.time() + wait_minutes * 60
+  while True:
+    if not stepfiles and wait_minutes:
+      tf.logging.info('Waiting till %s if a new file matching %s*-[0-9]*%s appears'
+                      % (time.asctime(time.localtime(exit_time)), path_prefix, path_suffix))
+      while True:
+        stepfiles = _read_stepfiles_list(path_prefix, path_suffix, min_steps)
+        if stepfiles or time.time() > exit_time:
+          break
+        time.sleep(sleep_sec)
+    if not stepfiles:
+      return
+
+    stepfile = stepfiles.pop()
+    exit_time, min_steps = stepfile.ctime + wait_minutes * 60, stepfile.steps + 1
+    yield stepfile

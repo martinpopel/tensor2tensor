@@ -55,18 +55,18 @@ def main(_):
   if not os.path.exists(os.path.join(output_dir, 'flags.txt')):
     shutil.copy2(os.path.join(model_dir, 'flags.txt'), os.path.join(output_dir, 'flags.txt'))
 
-  model_processed = 0
+  models_processed = 0
   queue = deque()
-  for model in bleu_hook.checkpoints_iterator(model_dir, FLAGS.wait_minutes, FLAGS.min_steps):
-    if model_processed == 0:
+  for model in bleu_hook.stepfiles_iterator(model_dir, FLAGS.wait_minutes, FLAGS.min_steps):
+    if models_processed == 0:
       var_list = tf.contrib.framework.list_variables(model.filename)
       avg_values = {}
       for (name, shape) in var_list:
         if not name.startswith("global_step"):
           avg_values[name] = np.zeros(shape)      
-    model_processed += 1
+    models_processed += 1
 
-    tf.logging.info("Loading " + model.filename)
+    tf.logging.info("Loading [%d]: %s" % (models_processed, model.filename))
     reader = tf.contrib.framework.load_checkpoint(model.filename)
     for name in avg_values:
       avg_values[name] += reader.get_tensor(name) / FLAGS.n
@@ -92,8 +92,7 @@ def main(_):
         sess.run(assign_op, {p: value})
       tf.logging.info("Storing to %s" % out_file)
       saver.save(sess, out_base_file, global_step=global_step)
-      tf.logging.info("Storing done")
-    os.utime(out_file + '.index', (model.time, model.time))
+    os.utime(out_file + '.index', (model.mtime, model.mtime))
 
     tf.reset_default_graph()
     first_model = queue.popleft()
